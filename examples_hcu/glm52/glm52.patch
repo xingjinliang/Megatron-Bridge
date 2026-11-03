@@ -284,7 +284,7 @@ index a0a92e2f3..59cf402db 100644
      glm45_air_106b_pretrain_config,
      glm45_air_106b_sft_config,
  )
-+from .bw1300.glm52 import (
++from .glm52 import (
 +    glm52_pretrain_16gpu_bw1300_bf16_test_config,
 +    glm52_sft_16gpu_bw1300_bf16_test_config,
 +)
@@ -298,6 +298,40 @@ index a0a92e2f3..59cf402db 100644
 +    "glm52_pretrain_16gpu_bw1300_bf16_test_config",
 +    "glm52_sft_16gpu_bw1300_bf16_test_config",
  ]
+diff --git a/src/megatron/bridge/recipes/glm/glm52.py b/src/megatron/bridge/recipes/glm/glm52.py
+new file mode 100644
+--- /dev/null
++++ b/src/megatron/bridge/recipes/glm/glm52.py
+@@ -0,0 +1,29 @@
++# Copyright (c) 2026, NVIDIA CORPORATION.  All rights reserved.
++# Copyright (c) 2026 Hygon Information Technology Co., Ltd.
++#
++# Licensed under the Apache License, Version 2.0 (the "License");
++# you may not use this file except in compliance with the License.
++# You may obtain a copy of the License at
++#
++#     http://www.apache.org/licenses/LICENSE-2.0
++#
++# Unless required by applicable law or agreed to in writing, software
++# distributed under the License is distributed on an "AS IS" BASIS,
++# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++# See the License for the specific language governing permissions and
++# limitations under the License.
++# ruff: noqa: F401
++"""Compatibility aliases for GLM-5.2 BW1300 recipe names."""
++
++from __future__ import annotations
++
++from megatron.bridge.recipes.glm.bw1300.glm52 import (
++    glm52_pretrain_16gpu_bw1300_bf16_test_config,
++    glm52_sft_16gpu_bw1300_bf16_test_config,
++)
++
++
++__all__ = [
++    "glm52_pretrain_16gpu_bw1300_bf16_test_config",
++    "glm52_sft_16gpu_bw1300_bf16_test_config",
++]
 diff --git a/src/megatron/bridge/recipes/glm/bw1300/__init__.py b/src/megatron/bridge/recipes/glm/bw1300/__init__.py
 new file mode 100644
 index 000000000..a3b6e4634
