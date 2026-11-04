@@ -1,0 +1,580 @@
+diff --git a/3rdparty/Megatron-LM/megatron/core/transformer/experimental_attention_variant/csa_utils/fused_sparse_attention.py b/3rdparty/Megatron-LM/megatron/core/transformer/experimental_attention_variant/csa_utils/fused_sparse_attention.py
+index 0d0009fc4..8b43c68f6 100644
+--- a/3rdparty/Megatron-LM/megatron/core/transformer/experimental_attention_variant/csa_utils/fused_sparse_attention.py
++++ b/3rdparty/Megatron-LM/megatron/core/transformer/experimental_attention_variant/csa_utils/fused_sparse_attention.py
+@@ -128,19 +128,26 @@ def _csa_fwd_flash_mla(
+             attn_sink = attn_sink_padded
+ 
+     with torch.cuda.nvtx.range("flash_mla_sparse_fwd"):
+-        res = _flash_mla_sparse_fwd(
+-            q,
+-            kv_3d,
+-            indices,
+-            softmax_scale,
+-            d_v=d_v,
++        from hip_dsa import sparse_attn_forward, sparse_attn_fwd_indexer
++
++        dsa_sparse_fwd = sparse_attn_fwd_indexer if indexer_topk > 0 else sparse_attn_forward
++        kwargs = dict(
++            q=q,
++            kv=kv_3d,
+             attn_sink=attn_sink,
++            topk_idxs=topk_idxs,
++            softmax_scale=softmax_scale,
+             topk_length=topk_length,
+-            indexer_topk=indexer_topk,
+         )
++        if indexer_topk > 0:
++            kwargs["indexer_topk"] = indexer_topk
++        res = dsa_sparse_fwd(**kwargs)
++
+         if indexer_topk > 0:
+             out, _max_logits, lse, lse_indexer = res
+         else:
++            if len(res) == 2:
++                res = (res[0], None, res[1])
+             out, _max_logits, lse = res
+             lse_indexer = None
+ 
+@@ -161,16 +168,19 @@ def _csa_fwd_flash_mla(
+ 
+ 
+ def _ensure_dsa_namespace():
+-    """Lazily import the cudnn-frontend DSA namespace."""
++    """Lazily import the HCU (hip_dsa) DSA namespace.
++
++    Only the namespace source changes: it is still cached in ``_DSA``, so every
++    ``_DSA.<op>`` call site in this module is untouched.
++    """
+     global _DSA
+     if _DSA is not None:
+         return
+     try:
+-        from cudnn import DSA as _ns
++        from hip_dsa import DSA as _ns
+     except ImportError as e:
+         raise ImportError(
+-            "cudnn-frontend DSA namespace not available. Install with "
+-            "`pip install nvidia-cudnn-frontend[cutedsl]`."
++            "hip_dsa DSA namespace not available. Install the hip_dsa package."
+         ) from e
+     _DSA = _ns
+ 
+diff --git a/3rdparty/Megatron-LM/megatron/core/transformer/experimental_attention_variant/dsa_cudnn_kernels.py b/3rdparty/Megatron-LM/megatron/core/transformer/experimental_attention_variant/dsa_cudnn_kernels.py
+index 82578b0ee..774b38fa0 100644
+--- a/3rdparty/Megatron-LM/megatron/core/transformer/experimental_attention_variant/dsa_cudnn_kernels.py
++++ b/3rdparty/Megatron-LM/megatron/core/transformer/experimental_attention_variant/dsa_cudnn_kernels.py
+@@ -906,15 +906,15 @@ def _dsa_fwd_flash_mla(
+         attn_sink = attn_sink_padded
+ 
+     with torch.cuda.nvtx.range("flash_mla_sparse_fwd"):
+-        out, _max_logits, lse = _flash_mla_sparse_fwd(
+-            q,
+-            kv_3d,
+-            indices,
+-            softmax_scale,
+-            d_v=d_v,
++        from hip_dsa import sparse_attn_forward
++
++        out, lse = sparse_attn_forward(
++            q=q,
++            kv=kv_3d,
+             attn_sink=attn_sink,
++            topk_idxs=topk_idxs,
++            softmax_scale=softmax_scale,
+             topk_length=topk_length,
+-            indexer_topk=0,
+         )
+ 
+     if padded_num_heads != actual_num_heads:
+@@ -925,16 +925,19 @@ def _dsa_fwd_flash_mla(
+ 
+ 
+ def _ensure_dsa_namespace() -> None:
+-    """Lazily import the cudnn-frontend DSA namespace."""
++    """Lazily import the HCU (hip_dsa) DSA namespace.
++
++    Only the namespace source changes: it is still cached in ``_cudnn_dsa``, so
++    every ``_cudnn_dsa.<op>`` call site in this module is untouched.
++    """
+     global _cudnn_dsa
+     if _cudnn_dsa is not None:
+         return
+     try:
+-        from cudnn import DSA as _ns
++        from hip_dsa import DSA as _ns
+     except ImportError as e:
+         raise ImportError(
+-            "cudnn-frontend DSA namespace not available. Install with "
+-            "`pip install nvidia-cudnn-frontend[cutedsl]`."
++            "hip_dsa DSA namespace not available. Install the hip_dsa package."
+         ) from e
+     _cudnn_dsa = _ns
+ 
+diff --git a/3rdparty/Megatron-LM/megatron/core/utils.py b/3rdparty/Megatron-LM/megatron/core/utils.py
+index 6bb7955d8..399dc83ad 100644
+--- a/3rdparty/Megatron-LM/megatron/core/utils.py
++++ b/3rdparty/Megatron-LM/megatron/core/utils.py
+@@ -556,9 +556,9 @@ def _missing_cudnn_dsa_kernel_dependencies() -> List[str]:
+     except ImportError:
+         missing.append("flash_mla")
+     try:
+-        from cudnn import DSA  # noqa: F401
++        from hip_dsa import DSA as _ns  # noqa: F401
+     except ImportError:
+-        missing.append("cudnn-frontend DSA (nvidia-cudnn-frontend[cutedsl])")
++        missing.append("HIP DSA (hip_dsa)")
+     return missing
+ 
+ 
+diff --git a/3rdparty/Megatron-LM/megatron/core/fusions/fused_mhc_kernels.py b/3rdparty/Megatron-LM/megatron/core/fusions/fused_mhc_kernels.py
+index a6de8bffc..d9cc32285 100644
+--- a/3rdparty/Megatron-LM/megatron/core/fusions/fused_mhc_kernels.py
++++ b/3rdparty/Megatron-LM/megatron/core/fusions/fused_mhc_kernels.py
+@@ -84,6 +84,23 @@ except ImportError:
+     pass
+ 
+ 
++# ---------------------------------------------------------------------------
++# Check HIP (fused_mhc) availability
++# ---------------------------------------------------------------------------
++_HIP_AVAILABLE = False
++try:
++    from fused_mhc import (
++        FusedSinkhorn as HipFusedSinkhorn,
++        FusedHAggregate as HipFusedHAggregate,
++        FusedHPostBDA as HipFusedHPostBDA,
++        FusedProjRmsComputeH as HipFusedProjRmsComputeH,
++    )
++
++    _HIP_AVAILABLE = True
++except ImportError:
++    pass
++
++
+ def is_cutile_available() -> bool:
+     """Return True if cuTile fused kernels are enabled."""
+     return _CUTILE_AVAILABLE and _cutile_supports_current_device()
+@@ -148,6 +165,11 @@ def is_triton_available() -> bool:
+     return _TRITON_AVAILABLE
+ 
+ 
++def is_hip_available() -> bool:
++    """Return True if the HIP fused mHC kernels are enabled."""
++    return _HIP_AVAILABLE
++
++
+ def _validate_mhc_backend(backend: MHCBackend) -> None:
+     """Validate an explicit mHC backend policy before dispatch."""
+     if backend not in _VALID_MHC_BACKENDS:
+@@ -2950,6 +2972,8 @@ def fused_sinkhorn(
+     """Project logits according to the configured backend policy."""
+     _validate_mhc_backend(backend)
+     triton_sinkhorn = _get_triton_sinkhorn(backend)
++    if is_hip_available():
++        return HipFusedSinkhorn.apply(input_logits, num_iterations, eps)
+     if triton_sinkhorn is not None:
+         return triton_sinkhorn(input_logits, num_iterations, eps)
+     if _backend_uses_cutile(backend):
+@@ -2960,6 +2984,8 @@ def fused_sinkhorn(
+ def fused_h_aggregate(x: Tensor, h_pre: Tensor, *, backend: MHCBackend = "auto") -> Tensor:
+     """Aggregate n streams into one according to the configured backend policy."""
+     _validate_mhc_backend(backend)
++    if is_hip_available():
++        return HipFusedHAggregate.apply(x, h_pre)
+     if _backend_uses_triton(backend) or _backend_uses_cutile(backend):
+         return FusedHAggregate.apply(x, h_pre, backend)
+     return native_h_aggregate(x, h_pre)
+@@ -2976,6 +3002,8 @@ def fused_h_post_bda(
+ ) -> Tensor:
+     """Compute H_res.T @ residual + H_post * (x + bias) using the backend policy."""
+     _validate_mhc_backend(backend)
++    if is_hip_available():
++        return HipFusedHPostBDA.apply(h_res, original_residual, h_post, x, bias)
+     if _backend_uses_triton(backend) or _backend_uses_cutile(backend):
+         return FusedHPostBDA.apply(h_res, original_residual, h_post, x, bias, backend)
+     return native_h_post_bda(h_res, original_residual, h_post, x, bias)
+@@ -2996,6 +3024,10 @@ def fused_proj_rms_compute_h(
+ ) -> Tuple[Tensor, Tensor, Tensor, Tensor]:
+     """Compute projection, RMS norm, and H outputs using the backend policy."""
+     _validate_mhc_backend(backend)
++    if is_hip_available():
++        return HipFusedProjRmsComputeH.apply(
++            x, weight, alpha_pre, alpha_post, alpha_res, bias, n, eps, compute_h_eps
++        )
+     if _backend_uses_cutile(backend):
+         return CutileProjRmsComputeH.apply(
+             x, weight, alpha_pre, alpha_post, alpha_res, bias, n, eps, compute_h_eps
+diff --git a/scripts/training/run_recipe.py b/scripts/training/run_recipe.py
+index 2e9457fd0..7366690c3 100755
+--- a/scripts/training/run_recipe.py
++++ b/scripts/training/run_recipe.py
+@@ -123,6 +123,8 @@ from megatron.bridge.recipes.utils.dataset_utils import (  # noqa: E402
+     dataset_train_mode,
+ )
+ 
++from megatron.bridge.common import _register_model_dump_hook  # noqa: E402
++
+ 
+ if TYPE_CHECKING:
+     from megatron.bridge.training.config import ConfigContainer
+@@ -596,6 +598,8 @@ def main(argv: list[str] | None = None) -> None:
+     )
+     step_func_name = _resolve_step_for_mode(step_func_name, args.mode)
+     forward_step = load_forward_step(step_func_name, mode=step_mode)
++    _register_model_dump_hook(recipe)
++
+     run_config(
+         config=recipe,
+         mode=execution_mode,
+diff --git a/src/megatron/bridge/common.py b/src/megatron/bridge/common.py
+new file mode 100644
+index 000000000..c982ea958
+--- /dev/null
++++ b/src/megatron/bridge/common.py
+@@ -0,0 +1,94 @@
++# Copyright (c) 2026, NVIDIA CORPORATION.  All rights reserved.
++# Copyright (c) 2026 Hygon Information Technology Co., Ltd.
++#
++# Licensed under the Apache License, Version 2.0 (the "License");
++# you may not use this file except in compliance with the License.
++# You may obtain a copy of the License at
++#
++#     http://www.apache.org/licenses/LICENSE-2.0
++#
++# Unless required by applicable law or agreed to in writing, software
++# distributed under the License is distributed on an "AS IS" BASIS,
++# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++# See the License for the specific language governing permissions and
++# limitations under the License.
++
++"""Helpers shared across Megatron Bridge modules."""
++
++import os
++
++
++def print_only_rank0(msg: str) -> None:
++    """Print a message only if the current process is rank 0.
++
++    Args:
++        msg (str): The message to print.
++    """
++    rank = int(
++        os.environ.get("RANK")
++        or os.environ.get("LOCAL_RANK")
++        or os.environ.get("OMPI_COMM_WORLD_RANK")
++        or "0"
++    )
++    if rank == 0:
++        print(msg, flush=True)
++
++
++# ============================ model dump (debug) ============================
++def _dump_model_structure(model, *, name="model", max_lines=400):
++    """Print a Megatron model structure. ``model`` may be one module or a PP stage list."""
++    wrappers = []
++    try:
++        from megatron.core.transformer.module import Float16Module
++
++        wrappers.append(Float16Module)
++    except Exception:
++        pass
++    for module_name, class_name in (
++        ("megatron.core.distributed", "DistributedDataParallel"),
++        ("torch.nn.parallel", "DistributedDataParallel"),
++    ):
++        try:
++            module = __import__(module_name, fromlist=[class_name])
++            wrappers.append(getattr(module, class_name))
++        except Exception:
++            pass
++
++    chunks = model if isinstance(model, (list, tuple)) else [model]
++    for index, chunk in enumerate(chunks):
++        module = chunk
++        while wrappers and isinstance(module, tuple(wrappers)):
++            module = module.module
++        text = repr(module)
++        lines = text.splitlines()
++        if len(lines) > max_lines:
++            body = "\n".join(lines[:max_lines]) + "\n... <truncated %d more lines>" % (
++                len(lines) - max_lines
++            )
++        else:
++            body = text
++        print_only_rank0("\n===== %s[%d] : %s =====\n%s" % (name, index, type(module).__name__, body))
++    return model
++
++
++def _register_model_dump_hook(cfg):
++    """Attach ``_dump_model_structure`` to the model config's pre-wrap hooks."""
++    model_cfg = getattr(cfg, "model", None)
++    if model_cfg is None:
++        print_only_rank0("[model-dump] WARNING: cfg.model is missing, skip model dump")
++        return
++    hooks = getattr(model_cfg, "pre_wrap_hooks", None)
++    if hooks is not None:
++        if _dump_model_structure not in hooks:
++            hooks.append(_dump_model_structure)
++        print_only_rank0("[model-dump] registered pre-wrap hook on %s" % type(model_cfg).__name__)
++        return
++    register = getattr(model_cfg, "register_pre_wrap_hook", None)
++    if callable(register):
++        register(_dump_model_structure)
++        print_only_rank0("[model-dump] registered pre-wrap hook via register_pre_wrap_hook")
++        return
++    print_only_rank0("[model-dump] WARNING: model config supports no pre-wrap hook, skip model dump")
++
++
++# ========================== end model dump (debug) ==========================
+diff --git a/src/megatron/bridge/models/conversion/auto_bridge.py b/src/megatron/bridge/models/conversion/auto_bridge.py
+index 04d12c20f..e1a301400 100644
+--- a/src/megatron/bridge/models/conversion/auto_bridge.py
++++ b/src/megatron/bridge/models/conversion/auto_bridge.py
+@@ -46,6 +46,7 @@ from safetensors.torch import save_file
+ from transformers.configuration_utils import PretrainedConfig
+ from typing_extensions import Unpack
+ 
++from megatron.bridge.common import print_only_rank0
+ from megatron.bridge.models.conversion import model_bridge
+ from megatron.bridge.models.conversion.model_bridge import (
+     HFWeightTuple,
+@@ -677,6 +678,14 @@ class AutoBridge(Generic[MegatronModelT]):
+             >>> bridge = AutoBridge.from_hf_pretrained("/path/to/model")
+         """
+ 
++        # HCU: load the checkpoint from a local mirror when LOCAL_HF_PATH is set.
++        # Recipes and CLIs keep naming the upstream checkpoint id, while cluster
++        # runs serve a local copy, so the caller's path is overridden here once.
++        local_hf_path = os.environ.get("LOCAL_HF_PATH")
++        if local_hf_path:
++            print_only_rank0(f"Loading the HuggingFace checkpoint from LOCAL_HF_PATH={local_hf_path}")
++            path = local_hf_path
++
+         # First load just the config to check architecture support
+         # Use thread-safe config loading to prevent race conditions
+         config_kwargs = dict(kwargs)
+diff --git a/src/megatron/bridge/recipes/__init__.py b/src/megatron/bridge/recipes/__init__.py
+--- a/src/megatron/bridge/recipes/__init__.py
++++ b/src/megatron/bridge/recipes/__init__.py
+@@ -38,8 +38,9 @@
+ from megatron.bridge.recipes.gemma4_vl.h100 import *
+ from megatron.bridge.recipes.glm import *
+ from megatron.bridge.recipes.glm.h100 import *
++from megatron.bridge.recipes.glm5next import *
+ from megatron.bridge.recipes.glm_vl import *
+ from megatron.bridge.recipes.glm_vl.h100 import *
+ from megatron.bridge.recipes.gpt import *
+ from megatron.bridge.recipes.gpt.h100 import *
+ from megatron.bridge.recipes.gpt_oss import *
+diff --git a/src/megatron/bridge/recipes/glm5next/__init__.py b/src/megatron/bridge/recipes/glm5next/__init__.py
+new file mode 100644
+--- /dev/null
++++ b/src/megatron/bridge/recipes/glm5next/__init__.py
+@@ -0,0 +1,22 @@
++# Copyright (c) 2026, NVIDIA CORPORATION.  All rights reserved.
++# Copyright (c) 2026 Hygon Information Technology Co., Ltd.
++#
++# Licensed under the Apache License, Version 2.0 (the "License");
++# you may not use this file except in compliance with the License.
++# You may obtain a copy of the License at
++#
++#     http://www.apache.org/licenses/LICENSE-2.0
++#
++# Unless required by applicable law or agreed to in writing, software
++# distributed under the License is distributed on an "AS IS" BASIS,
++# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++# See the License for the specific language governing permissions and
++# limitations under the License.
++from .glm53_flash import (
++    glm53_flash_pretrain_16gpu_bw1300_bf16_test_config,
++)
++
++
++__all__ = [
++    "glm53_flash_pretrain_16gpu_bw1300_bf16_test_config",
++]
+diff --git a/src/megatron/bridge/recipes/glm5next/glm53_flash.py b/src/megatron/bridge/recipes/glm5next/glm53_flash.py
+new file mode 100644
+--- /dev/null
++++ b/src/megatron/bridge/recipes/glm5next/glm53_flash.py
+@@ -0,0 +1,27 @@
++# Copyright (c) 2026, NVIDIA CORPORATION.  All rights reserved.
++# Copyright (c) 2026 Hygon Information Technology Co., Ltd.
++#
++# Licensed under the Apache License, Version 2.0 (the "License");
++# you may not use this file except in compliance with the License.
++# You may obtain a copy of the License at
++#
++#     http://www.apache.org/licenses/LICENSE-2.0
++#
++# Unless required by applicable law or agreed to in writing, software
++# distributed under the License is distributed on an "AS IS" BASIS,
++# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++# See the License for the specific language governing permissions and
++# limitations under the License.
++# ruff: noqa: F401
++"""Compatibility aliases for GLM-5.3-Flash recipe names."""
++
++from __future__ import annotations
++
++from megatron.bridge.recipes.glm5next.bw1300.glm53_flash import (
++    glm53_flash_pretrain_16gpu_bw1300_bf16_test_config,
++)
++
++
++__all__ = [
++    "glm53_flash_pretrain_16gpu_bw1300_bf16_test_config",
++]
+diff --git a/src/megatron/bridge/recipes/glm5next/bw1300/__init__.py b/src/megatron/bridge/recipes/glm5next/bw1300/__init__.py
+new file mode 100644
+--- /dev/null
++++ b/src/megatron/bridge/recipes/glm5next/bw1300/__init__.py
+@@ -0,0 +1,20 @@
++# Copyright (c) 2026, NVIDIA CORPORATION.  All rights reserved.
++# Copyright (c) 2026 Hygon Information Technology Co., Ltd.
++#
++# Licensed under the Apache License, Version 2.0 (the "License");
++# you may not use this file except in compliance with the License.
++# You may obtain a copy of the License at
++#
++#     http://www.apache.org/licenses/LICENSE-2.0
++#
++# Unless required by applicable law or agreed to in writing, software
++# distributed under the License is distributed on an "AS IS" BASIS,
++# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++# See the License for the specific language governing permissions and
++# limitations under the License.
++from megatron.bridge.recipes.glm5next.bw1300.glm53_flash import *  # noqa: F403
++
++
++__all__ = [
++    "glm53_flash_pretrain_16gpu_bw1300_bf16_test_config",
++]
+diff --git a/src/megatron/bridge/recipes/glm5next/bw1300/glm53_flash.py b/src/megatron/bridge/recipes/glm5next/bw1300/glm53_flash.py
+new file mode 100644
+--- /dev/null
++++ b/src/megatron/bridge/recipes/glm5next/bw1300/glm53_flash.py
+@@ -0,0 +1,122 @@
++# Copyright (c) 2026, NVIDIA CORPORATION.  All rights reserved.
++# Copyright (c) 2026 Hygon Information Technology Co., Ltd.
++# Modified by Hygon Information Technology Co., Ltd., 2026.
++#
++# Licensed under the Apache License, Version 2.0 (the "License");
++# you may not use this file except in compliance with the License.
++# You may obtain a copy of the License at
++#
++#     http://www.apache.org/licenses/LICENSE-2.0
++#
++# Unless required by applicable law or agreed to in writing, software
++# distributed under the License is distributed on an "AS IS" BASIS,
++# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++# See the License for the specific language governing permissions and
++# limitations under the License.
++"""BW1300 recipes for GLM-5.3-Flash."""
++
++from __future__ import annotations
++
++from megatron.bridge import AutoBridge
++from megatron.bridge.recipes.common import _pretrain_common
++from megatron.bridge.recipes.utils.environment_utils import COMMON_RECIPE_ENV_VARS
++from megatron.bridge.recipes.utils.optimizer_utils import distributed_fused_adam_with_cosine_annealing
++from megatron.bridge.training.config import ConfigContainer
++from megatron.bridge.training.mixed_precision import bf16_mixed
++
++
++_GLM53_MODEL_ID = "zai-org/GLM-5.3-Flash"
++
++
++def glm53_flash_pretrain_16gpu_bw1300_bf16_test_config() -> ConfigContainer:
++    """GLM-5.3-Flash bounded pretraining on 16 BW1300 GPUs."""
++    cfg = _pretrain_common()
++
++    cfg.model = AutoBridge.from_hf_pretrained(_GLM53_MODEL_ID).get_model_config()
++
++    # ========== test config ==========
++    # GLM-5.3-Flash interleaves KDA with DSA: every fourth decoder block is DSA, the others
++    # are KDA, and the first three blocks are dense while the rest are MoE. Keeping the first
++    # twelve blocks exercises all four layer types. num_layers and moe_layer_freq must follow
++    # the pattern: the bridge derives both from the 45-block reference config (90 layers).
++    cfg.model.hybrid_layer_pattern = "K-K-K-DEKEKEKEDEKEKEKEDE"
++    cfg.model.num_layers = 24
++    cfg.model.moe_layer_freq = [0, 0, 0, 0, 0, 0, 0, 1, 0, 1, 0, 1, 0, 1, 0, 1, 0, 1, 0, 1, 0, 1, 0, 1]
++    # ========== test config ==========
++
++    # Text-only pretraining never runs the vision tower. Freezing it (patch_embed, blocks and
++    # the merger) keeps its parameters out of the DDP param-gather buckets: an unused bucket
++    # group leaves its all-gather handle outstanding and trips
++    # "assert self.param_gather_handle is None" when ddp.overlap_param_gather=True.
++    cfg.model.freeze_vision_model = True
++    cfg.model.freeze_vision_projection = True
++
++    cfg.tokenizer.tokenizer_model = _GLM53_MODEL_ID
++
++    cfg.model.seq_length = 4096
++    cfg.model.tensor_model_parallel_size = 1
++    cfg.model.pipeline_model_parallel_size = 1
++    cfg.model.context_parallel_size = 1
++    cfg.model.expert_model_parallel_size = 16
++    cfg.model.expert_tensor_parallel_size = 1
++    cfg.model.microbatch_group_size_per_vp_stage = 16
++
++    cfg.model.dsa_kernel_backend = "cudnn"
++    cfg.model.calculate_per_token_loss = True
++    cfg.model.cross_entropy_loss_fusion = False
++    cfg.model.cross_entropy_fusion_impl = "native"
++    cfg.model.gradient_accumulation_fusion = True
++    cfg.model.moe_token_dispatcher_type = "flex"
++    cfg.model.moe_flex_dispatcher_backend = "deepep"
++    cfg.model.moe_shared_expert_overlap = False
++    cfg.model.moe_router_force_load_balancing = False
++    cfg.model.persist_layer_norm = True
++    cfg.model.bias_dropout_fusion = True
++    cfg.model.bias_activation_fusion = True
++    cfg.model.recompute_granularity = None
++    cfg.model.recompute_method = None
++    cfg.model.recompute_num_layers = None
++
++    cfg.mixed_precision = bf16_mixed()
++    cfg.ddp.average_in_collective = False
++    cfg.ddp.use_distributed_optimizer = True
++    cfg.ddp.overlap_grad_reduce = True
++    # Disabled: with this hybrid + mHC model the async param gather leaves a bucket group's
++    # handle outstanding and trips "assert self.param_gather_handle is None"
++    # (param_and_grad_buffer.py:461). Grad-reduce overlap stays enabled.
++    cfg.ddp.overlap_param_gather = False
++
++    cfg.train.micro_batch_size = 1
++    cfg.train.manual_gc = True
++    cfg.train.manual_gc_interval = 10
++    cfg.validation.eval_iters = 0
++    cfg.validation.eval_interval = 0
++    cfg.logger.log_interval = 1
++
++    cfg.dataset.seq_length = 4096
++    cfg.dataset.num_workers = 8
++    cfg.dataset.random_seed = 1234
++    cfg.rng.seed = 1234
++    cfg.train.train_iters = 100
++    cfg.train.global_batch_size = 1024
++    cfg.mixed_precision.grad_reduce_in_fp32 = False
++    cfg.ddp.grad_reduce_in_fp32 = False
++    cfg.optimizer, cfg.scheduler = distributed_fused_adam_with_cosine_annealing(
++        lr_warmup_iters=40,
++        max_lr=3e-4,
++        min_lr=3e-5,
++    )
++    cfg.scheduler.lr_decay_iters = 100
++    cfg.optimizer.use_precision_aware_optimizer = True
++    cfg.checkpoint.save_interval = 50
++    cfg.checkpoint.load = None
++    cfg.env_vars = {
++        **COMMON_RECIPE_ENV_VARS,
++        "DEEP_EP_NORMAL_MNVL": "1",
++    }
++    return cfg
++
++
++__all__ = [
++    "glm53_flash_pretrain_16gpu_bw1300_bf16_test_config",
++]

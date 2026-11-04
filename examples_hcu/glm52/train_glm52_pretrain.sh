@@ -169,17 +169,15 @@ echo "Master:      ${MASTER_ADDR}:${MASTER_PORT}"
 echo "======================================"
 
 # ===================================== Execution =====================================
-# glm52 needs the patch applied before running. Apply each file's hunks on their
-# own: a file that is already patched simply fails quietly, a missing one is
-# applied, so this is idempotent and also completes a partially patched tree.
+# Apply the HCU patch, then run. patch_apply is idempotent; if the tree is in a
+# mixed state (e.g. a previously half-applied patch), revert everything and retry.
 cd ${MEGATRON_PATH}
 PATCH_FILE=examples_hcu/glm52/glm52.patch
-while read -r _added _removed patch_path; do
-    [ -n "${patch_path:-}" ] || continue
-    if git apply --include="${patch_path}" "${PATCH_FILE}" 2>/dev/null; then
-        echo -e "${YELLOW}[Patch] applied ${patch_path}${RESET}"
-    fi
-done < <(git apply --numstat "${PATCH_FILE}")
+if ! ./examples_hcu/patch_apply.sh "${PATCH_FILE}"; then
+    echo -e "${YELLOW}[Patch] apply failed, reverting everything and retrying${RESET}"
+    ./examples_hcu/patch_revert.sh "${PATCH_FILE}"
+    ./examples_hcu/patch_apply.sh "${PATCH_FILE}"
+fi
 cd ${CURRENT_DIR}
 
 env_args=(

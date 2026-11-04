@@ -1,4 +1,4 @@
-# GLM 5.2
+# GLM-5.2
 
 ## Supported
 | Hardware | Recipe | Precision and optimizer |
@@ -104,7 +104,7 @@ modelscope download --model ZhipuAI/GLM-5.2 --local_dir ./GLM-5.2
 
 （1）配置hostfile文件
 
-进入`/workspace/Megatron-Bridge/examples_hcu/glm`，填写`hostfile`文件，示例如下（多个节点填写多行）
+进入`/workspace/Megatron-Bridge/examples_hcu/glm52`，填写`hostfile`文件，示例如下（多个节点填写多行）
 
 ```shell
 127.0.0.1
@@ -115,7 +115,7 @@ modelscope download --model ZhipuAI/GLM-5.2 --local_dir ./GLM-5.2
 
 （2）根据任务填写脚本
 
-进入`/workspace/Megatron-Bridge/examples_hcu/glm`，根据上述文件路径，填写如下变量：
+进入`/workspace/Megatron-Bridge/examples_hcu/glm52`，根据上述文件路径，填写如下变量：
 
 #### pretrain
 ```shell
@@ -135,7 +135,7 @@ export LOCAL_HF_PATH=/path/to/GLM-5.2
 #### pretrain
 ```shell
 docker exec -it "your container name" bash
-cd /workspace/Megatron-Bridge/examples_hcu/glm
+cd /workspace/Megatron-Bridge/examples_hcu/glm52
 
 ./train_glm52_pretrain.sh <RECIPE> <MODE> [HOSTFILE] [NODES]
 
@@ -149,7 +149,7 @@ NODES: The number of nodes you use
 #### sft
 ```shell
 docker exec -it "your container name" bash
-cd /workspace/Megatron-Bridge/examples_hcu/glm
+cd /workspace/Megatron-Bridge/examples_hcu/glm52
 
 ./train_glm52_sft.sh <RECIPE> <MODE> [HOSTFILE] [NODES]
 
